@@ -64,3 +64,41 @@ Para concluir que no hay cambios, Terraform necesita tres cosas: la configuraci�
 ## Estado final de `main.tf`
 
 Tras los ejercicios quedó con `memory = 256`, `memory_swap = 512` y puerto externo 8081. Los recursos ya fueron destruidos.
+
+## 5. Análisis de un plan en Google Cloud (solo lectura)
+
+### 5.1 Configuración
+
+Provider `hashicorp/google` 8.1.0, región `us-central1`. Tres recursos: un repositorio de Artifact Registry (`tf-demo-apps`), una service account (`tf-demo-runtime`) y un servicio de Cloud Run v2 (`tf-demo-api`) que corre con esa cuenta. El project ID se omite para no acoplar la configuración a un proyecto. `deletion_protection = false` es solo para la demostración.
+
+### 5.2 Grafo de dependencias
+
+```
+Artifact Registry            (sin aristas)
+Service Account  ──▶  Cloud Run
+```
+
+1. **¿Qué recursos pueden comenzar sin esperar a otro?** El repositorio de Artifact Registry y la service account.
+2. **¿Cuál debe esperar a la cuenta de servicio?** Cloud Run, porque usa `google_service_account.runtime.email`.
+3. **¿Por qué la posición de los bloques no lo responde?** Terraform construye el grafo a partir de las referencias entre recursos, no del orden en `main.tf`.
+4. **¿Qué relación falta?** El repositorio existe para guardar las imágenes que Cloud Run despliega, pero ninguna referencia los conecta. Hoy Cloud Run usa una imagen pública de ejemplo (`us-docker.pkg.dev/cloudrun/container/hello`) y no una del repositorio. Cuando use una imagen propia, esa ruta crearía la dependencia.
+
+### 5.3 Reemplazo de una cuenta de servicio
+
+Plan: `1 to add, 1 to change, 1 to destroy`.
+
+1. **¿Qué recurso explica la adición y la destrucción?** La service account: se crea la nueva y se destruye la anterior, porque el plan indica que debe reemplazarse. Esa conclusión se verifica en el plan del provider (`# forces replacement`) y en su documentación.
+2. **¿Por qué Cloud Run aparece como actualización?** Cambia su plantilla para usar el email de la identidad nueva. El servicio no se recrea.
+3. **¿Qué pasa con los permisos manuales?** Se concedieron solo a la identidad anterior y no se transfieren a la nueva. Como no están en la configuración, Terraform no los planifica. Cloud Run puede quedar sin permisos y fallar.
+4. **¿Por qué el resumen no basta?** Solo cuenta acciones. No dice que se pierden permisos concedidos fuera de Terraform. Hay que leer qué se reemplaza y qué depende de ello.
+5. **¿Y si los IAM estuvieran declarados?** Los bindings aparecerían en el plan y se recrearían sobre la cuenta nueva. El impacto sería visible y revisable antes de aprobar.
+
+### 5.4 Fallos durante la aplicación
+
+Escenario: Cloud Run usa `image = "${google_artifact_registry_repository.apps.registry_uri}/api:1.0"`. Esa referencia crea una dependencia del servicio hacia el repositorio, pero declarar el repositorio no implica que la imagen `api:1.0` exista dentro de él.
+
+1. **¿Puede Terraform construir un plan aunque la imagen no exista?** Sí. El plan calcula acciones con la configuración y el state, y no comprueba que la imagen exista en el repositorio.
+2. **¿Qué podría ocurrir durante apply?** El repositorio y la service account se crean. Después Cloud Run falla al desplegar porque no encuentra la imagen.
+3. **¿Debe suponerse que Terraform deshace lo creado?** No. Lo creado queda en el state y Terraform se detiene con error. Se corrige el problema (por ejemplo, subir la imagen) y se vuelve a aplicar, y solo se crea lo que falta.
+
+Límite esencial: un plan permite revisar las acciones que Terraform puede calcular, pero no demuestra que todas las operaciones remotas terminarán correctamente.
