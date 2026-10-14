@@ -102,3 +102,46 @@ Escenario: Cloud Run usa `image = "${google_artifact_registry_repository.apps.re
 3. **¿Debe suponerse que Terraform deshace lo creado?** No. Lo creado queda en el state y Terraform se detiene con error. Se corrige el problema (por ejemplo, subir la imagen) y se vuelve a aplicar, y solo se crea lo que falta.
 
 Límite esencial: un plan permite revisar las acciones que Terraform puede calcular, pero no demuestra que todas las operaciones remotas terminarán correctamente.
+
+## 6. Actividades de análisis
+
+### Actividad 1. Interpretación de un plan
+
+Plan: `1 to add, 1 to change, 1 to destroy`, con `google_cloud_run_v2_service.api` actualizado y `google_service_account.runtime` reemplazado.
+
+| Contador | Recurso | Por qué |
+|---|---|---|
+| 1 to add | `google_service_account.runtime` | Se crea la cuenta nueva. |
+| 1 to destroy | `google_service_account.runtime` | Se destruye la cuenta anterior. Reemplazo = destroy + create del mismo recurso. |
+| 1 to change | `google_cloud_run_v2_service.api` | Se actualiza in situ para usar el email de la cuenta nueva. |
+
+El resumen no basta para aprobar porque solo cuenta acciones. No dice qué se pierde con la cuenta destruida (por ejemplo, permisos concedidos manualmente o fuera de Terraform), ni qué atributo fuerza el reemplazo, ni qué servicios o clientes dependen de la identidad anterior. Hay que leer el detalle del plan y evaluar las consecuencias operativas.
+
+### Actividad 2. Dependencias
+
+Recursos: repositorio de Artifact Registry, cuenta de servicio, Cloud Run y una asignación IAM (la cuenta recibe acceso al repositorio).
+
+```
+Service Account ──▶ Cloud Run
+Service Account ──▶ IAM binding
+Artifact Registry ──▶ IAM binding
+```
+
+| Arista | Referencia concreta que la justifica |
+|---|---|
+| Service Account → Cloud Run | `service_account = google_service_account.runtime.email` |
+| Service Account → IAM binding | `member = "serviceAccount:${google_service_account.runtime.email}"` |
+| Artifact Registry → IAM binding | `repository = google_artifact_registry_repository.apps.name` (o `repository_id`) |
+
+No hay arista entre Cloud Run y el IAM binding, porque ninguno referencia al otro. Terraform podría crear Cloud Run antes de que el permiso exista. Si el servicio usara una imagen del repositorio, podría fallar al descargarla. Se resolvería con una referencia real o con `depends_on`.
+
+### Actividad 3. Impacto de un reemplazo
+
+| Recurso | Información necesaria para evaluar el impacto |
+|---|---|
+| Contenedor sin estado | Qué atributo fuerza el reemplazo. Si hay tráfico activo o conexiones abiertas durante el cambio. Si otro recurso usa su ID. Al no tener estado, normalmente el impacto es una interrupción breve y no hay pérdida de datos. |
+| Repositorio de imágenes | Qué imágenes y etiquetas contiene y si se pueden reconstruir o volver a subir. Quién despliega desde él (Cloud Run, CI/CD). Si las referencias a su URI seguirán siendo válidas. Al destruirlo se pierden las imágenes. |
+| Cuenta de servicio con permisos | Qué roles tiene, tanto los declarados en Terraform como los concedidos manualmente. Qué servicios la usan. Si hay claves o integraciones externas que la referencian. La cuenta nueva no hereda permisos. |
+| Servicio de Cloud Run consumido por clientes | Qué URL usan los clientes y si cambia al reemplazar. Si hay tráfico en curso, dominios personalizados o configuración fuera de Terraform. Si se puede hacer el cambio sin interrupción. |
+
+Distinción clave: que un recurso sea reemplazado es un hecho técnico que muestra el plan (destroy + create). Las consecuencias operativas (pérdida de datos, permisos, interrupción de clientes) dependen de lo que ese recurso contiene y de quién lo usa, y no aparecen en el resumen.
